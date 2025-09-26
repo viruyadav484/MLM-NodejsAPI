@@ -1,0 +1,12 @@
+open CMD 
+
+
+go cd C:\orientdb\bin
+and run tgis command
+server.bat
+
+delete all item for VERTEX
+DELETE VERTEX V
+
+get all item
+SELECT * FROM User
