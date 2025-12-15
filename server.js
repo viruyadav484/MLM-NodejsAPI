@@ -1,213 +1,402 @@
-
-
-
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { connectDB, getDB } = require('./db');
+const { connectOrientDB, getDB } = require('./orientdbConnection');
+const { connectMongoDB } = require('./mongodbConnection');
+const { connectRedis } = require('./redisConnection');
+const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 app.use(express.json());
-
-const PORT = 5009;
-const JWT_SECRET = "testTree";
+app.use(cors());
+const PORT = process.env.PORT || 5009;
 
 let db;
+let mongoClient;
+let redis;
 
 async function startServer() {
-  db = await connectDB();
+  db = await connectOrientDB();
+  mongoClient = await connectMongoDB();
+  redis = await connectRedis();
 
- /**
- * Signup Route - Places users in a binary tree based on referral & position.
- */
-app.post('/signup', async (req, res) => {
-  const { name, email, mobile, referrerId, position } = req.body;
+  // ------------------ SIGNUP ------------------
+  app.post('/signup', async (req, res) => {
+    const { name, email, mobile, referrerId, position } = req.body;
+    let {refferalCode} = req.body;
+    refferalCode = refferalCode || generateUserId()
+    try {
+      // STEP 1 — check Redis cache first
+      const cachedUser = await redis.get(`user:${email}:${mobile}`);
+      if (cachedUser) {
+        return res.status(400).json({ message: 'User already exists (cached)' });
+      }
 
-  try {
-    // const hashedPassword = await bcrypt.hash(password, 10);
-    const userId = `MH28ABC${Math.floor(100 + Math.random() * 900)}`;
-
-    // Check if User class exists
-    let userClass = await db.exec(`SELECT FROM (SELECT expand(classes) FROM metadata:schema) WHERE name = 'User'`);
-    if (!userClass.length) {
-      await db.exec(`CREATE CLASS User EXTENDS V`);
-    }
-
-    // Check if REFERRED_BY edge class exists
-    let edgeClass = await db.exec(`SELECT FROM (SELECT expand(classes) FROM metadata:schema) WHERE name = 'REFERRED_BY'`);
-    if (!edgeClass.length) {
-      await db.exec(`CREATE CLASS REFERRED_BY EXTENDS E`);
-    }
-
-    // Check if root exists
-    const rootUser = await db.exec(`SELECT id FROM User LIMIT 1`);
-
-    if (!rootUser.length) {
-      await db.exec(
-        `INSERT INTO User SET id=:id, name=:name, email=:email, mobile=:mobile, 
-        verified=false, enrollmentDate=sysdate(), enrolled=false, bankVerified=false, position='root', referralCredits=0`,
-        { params: { id: userId, name, email, mobile } }
+      // STEP 2 — DB duplicate check
+      const existingUser = await db.exec(
+        `SELECT FROM User WHERE mobile = :mobile OR email = :email`,
+        { params: { mobile, email } }
       );
-      return res.json({ message: "First user created as root", userId });
+      if (existingUser.length > 0) {
+        await redis.set(`user:${email}:${mobile}`, JSON.stringify(existingUser[0]), 'EX', 60 * 10); // cache 10 mins
+        return res.status(400).json({ message: 'User already exists' });
+      }
+
+      // STEP 3 — Root user check
+      const rootUser = await db.exec(`SELECT FROM User WHERE position = 'root' LIMIT 1`);
+      if (rootUser.length === 0) {
+        const root = await db.exec(
+          `INSERT INTO User SET name=:name, email=:email, mobile=:mobile, userId=:userId, position='root', parent=null`,
+          { params: { name, email, mobile, userId: refferalCode } }
+        );
+
+        // Clear related caches
+        await redis.del('userTree:root');
+        return res.status(201).json({ message: 'Root user created', user: root[0] });
+      }
+
+      let parentId = null;
+      let childPosition = 'left';
+
+      // STEP 4 — Placement logic
+      if (!referrerId && !position) {
+        parentId = await findFirstAvailableSlot(rootUser[0]['@rid']);
+      } else if (!referrerId && position) {
+        parentId = await findFirstAvailableSlot(rootUser[0]['@rid']);
+        childPosition = position.toLowerCase() === 'right' ? 'right' : 'left';
+      } else if (referrerId) {
+        const ref = await db.exec(`SELECT FROM User WHERE userId=:id`, { params: { id: referrerId } });
+        if (ref.length === 0) return res.status(400).json({ message: 'Invalid referrer ID' });
+        const refUser = ref[0];
+
+        if (!position) {
+          parentId = await findFirstAvailableSlot(refUser['@rid']);
+        } else if (position.toLowerCase() === 'left') {
+          const leftChild = await db.exec(
+            `SELECT FROM User WHERE parent=:pid AND position='left' LIMIT 1`,
+            { params: { pid: refUser['@rid'] } }
+          );
+          if (leftChild.length === 0) {
+            parentId = refUser['@rid'];
+          } else {
+            parentId = await findFirstAvailableSlot(leftChild[0]['@rid']);
+          }
+        } else if (position.toLowerCase() === 'right') {
+          const rightChild = await db.exec(
+            `SELECT FROM User WHERE parent=:pid AND position='right' LIMIT 1`,
+            { params: { pid: refUser['@rid'] } }
+          );
+          if (rightChild.length === 0) {
+            parentId = refUser['@rid'];
+            childPosition = 'right';
+          } else {
+            parentId = await findFirstAvailableSlot(rightChild[0]['@rid']);
+          }
+        }
+      }
+
+      if (!parentId) {
+        return res.status(400).json({ message: 'No available placement found' });
+      }
+
+      // STEP 5 — Insert user
+      const newUser = await db.exec(
+        `INSERT INTO User SET name=:name, email=:email, mobile=:mobile, userId=:userId, parent=:parent, position=:pos`,
+        {
+          params: {
+            name,
+            email,
+            mobile,
+            userId: refferalCode,
+            parent: parentId,
+            pos: childPosition,
+          },
+        }
+      );
+
+      // Clear or update relevant cache
+      await redis.del(`userTree:${referrerId}`);
+      await redis.del('userTree:root');
+
+      res.status(201).json({
+        message: 'User placed successfully',
+        user: newUser[0],
+      });
+    } catch (err) {
+      console.error('Signup error:', err);
+      res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+  });
+
+  // ------------------ CACHED USER TREE ------------------
+  app.get('/user/tree/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+      // 1️⃣ Try Redis cache first
+      const cacheKey = `userTree:${userId}`;
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return res.status(200).json({ message: 'User tree (cached)', tree: JSON.parse(cached) });
+      }
+
+      // 2️⃣ Otherwise query OrientDB
+      const user = await db.exec(`SELECT FROM User WHERE userId = :userId`, { params: { userId } });
+      if (!user.length) return res.status(404).json({ message: 'User not found' });
+
+      const tree = await buildUserTree(user[0]['@rid']);
+
+      // 3️⃣ Cache result for 15 minutes
+      await redis.set(cacheKey, JSON.stringify(tree), 'EX', 60 * 15);
+
+      res.status(200).json({ message: 'User tree fetched', tree });
+    } catch (error) {
+      console.error('Error fetching user tree:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ------------------ Helper Functions ------------------
+  async function findFirstAvailableSlot(startNodeRid) {
+    const queue = [startNodeRid];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const leftChild = await db.exec(
+        `SELECT FROM User WHERE parent=:pid AND position='left' LIMIT 1`,
+        { params: { pid: current } }
+      );
+      if (leftChild.length === 0) return current;
+      const rightChild = await db.exec(
+        `SELECT FROM User WHERE parent=:pid AND position='right' LIMIT 1`,
+        { params: { pid: current } }
+      );
+      if (leftChild.length > 0) queue.push(leftChild[0]['@rid']);
+      if (rightChild.length > 0) queue.push(rightChild[0]['@rid']);
+    }
+    return null;
+  }
+
+  function generateUserId() {
+    return `MH28ABC${Math.floor(100 + Math.random() * 900)}`;
+  }
+
+  async function buildUserTree(userRid) {
+    const userData = await db.exec(
+      `SELECT @rid as rid, userId, name, email, mobile, position, referralCredits FROM User WHERE @rid = :rid`,
+      { params: { rid: userRid } }
+    );
+    if (!userData.length) return null;
+    const user = userData[0];
+
+    const children = await db.exec(
+      `SELECT @rid as rid, userId, name, position, referralCredits FROM User WHERE parent = :parentRid`,
+      { params: { parentRid: user.rid } }
+    );
+    const leftChild = children.find(c => c.position === 'left') || null;
+    const rightChild = children.find(c => c.position === 'right') || null;
+
+    return {
+      userId: user.userId,
+      name: user.name,
+      position: user.position,
+      referralCredits: user.referralCredits || 0,
+      left: leftChild ? await buildUserTree(leftChild.rid) : null,
+      right: rightChild ? await buildUserTree(rightChild.rid) : null,
+    };
+  }
+
+
+  // ------------------ CHECK REFERRAL ID VALID OR NOT ------------------
+app.get('/checkReferral/:referralId', async (req, res) => {
+  let { referralId } = req.params;
+ console.log("-------------------referralId--------------------",referralId)
+  try {
+    if (!referralId) {
+      return res.status(400).json({ message: "Referral ID is required" });
     }
 
-    let placement;
-    let parentId;
+    let position = '';
+    let cleanId = referralId;
+ console.log("-------------------cleanId--------------------",cleanId)
+    // CASE: Referral ID in format: MH01AAA001-L  OR  9000090000-R
+    if (referralId.includes('-')) {
+      const parts = referralId.split('-');
+      cleanId = parts[0];
+      const pos = parts[1]?.toUpperCase();
 
-    if (referrerId) {
-      // Place under given referrer
-      placement = await findAvailablePosition(referrerId, position);
-      if (!placement) {
-        return res.status(400).json({ message: "No available position found" });
-      }
-      parentId = placement.parentId;
-    } else {
-      // No referrer → place in first available LEFT spot under root
-      placement = await findAvailablePosition(rootUser[0].id, "left");
-      if (!placement) {
-        return res.status(400).json({ message: "No available position found in tree" });
-      }
-      parentId = placement.parentId;
+      if (pos === 'L') position = 'left';
+      else if (pos === 'R') position = 'right';
+      else position = '';  // invalid (not L or R)
     }
-
-    // Create new user
-    await db.exec(
-      `INSERT INTO User SET id=:id, name=:name, email=:email, mobile=:mobile, 
-      verified=false, enrollmentDate=sysdate(), enrolled=false, bankVerified=false, position=:pos, referralCredits=0`,
-      { params: { id: userId, name, email, mobile, pos: placement.side } }
+ console.log("-------------------3--------------------")
+    // ---------- 1️⃣ Check Redis Cache ----------
+    const cached = await redis.get(`referral:${cleanId}`);
+    if (cached) {
+      return res.status(200).json({
+        message: "Referral checked (cached)",
+        valid: JSON.parse(cached).valid,
+        referralId: cleanId,
+        position
+      });
+    }
+console.log("-------------------4--------------------")
+    // ---------- 2️⃣ Check in OrientDB ----------
+    const result = await db.exec(
+      `SELECT FROM User WHERE userId = :uid LIMIT 1`,
+      { params: { uid: cleanId } }
     );
 
-    // Create edge Parent -> Child
-    await db.exec(
-      `CREATE EDGE REFERRED_BY FROM (SELECT FROM User WHERE id=:parentId) TO (SELECT FROM User WHERE id=:id) 
-      SET side=:pos`,
-      { params: { id: userId, parentId, pos: placement.side } }
+    const isValid = result.length > 0;
+console.log("-------------------5--------------------")
+    // ---------- 3️⃣ Store result in cache (10 min) ----------
+    await redis.set(
+      `referral:${cleanId}`,
+      JSON.stringify({ valid: isValid }),
+      'EX',
+      60 * 10
     );
+console.log("-------------------6--------------------")
+    return res.status(200).json({
+      message: "Referral checked",
+      valid: isValid,
+      referralId: cleanId,
+      position
+    });
 
-    // Always give referral credits up the chain
-    await giveReferralCredits(parentId);
-
-    res.json({ message: "User created successfully", userId, placedUnder: parentId, side: placement.side });
-
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error("Referral check error:", err);
+    return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-/**
- * Find first available position in binary tree using BFS.
- */
-async function findAvailablePosition(referrerId, preferredSide) {
-  let queue = [{ parentId: referrerId }];
 
-  while (queue.length > 0) {
-    let { parentId } = queue.shift();
-
-    const children = await db.exec(
-      `SELECT id, position FROM User WHERE id IN 
-      (SELECT expand(out("REFERRED_BY")) FROM User WHERE id=:id)`,
-      { params: { id: parentId } }
-    );
-
-    let leftChild = children.find(c => c.position === 'left');
-    let rightChild = children.find(c => c.position === 'right');
-
-    if (preferredSide === 'left' && !leftChild) return { parentId, side: 'left' };
-    if (preferredSide === 'right' && !rightChild) return { parentId, side: 'right' };
-
-    if (!leftChild) return { parentId, side: 'left' };
-    if (!rightChild) return { parentId, side: 'right' };
-
-    queue.push({ parentId: leftChild.id });
-    queue.push({ parentId: rightChild.id });
-  }
-  return null;
-}
-
-/**
- * Give referral credits up the chain.
- */
-async function giveReferralCredits(userId) {
-  let currentUser = userId;
-  let level = 1;
-
-  while (currentUser) {
-    await db.exec(
-      `UPDATE User SET referralCredits = referralCredits + :credit WHERE id=:id`,
-      { params: { id: currentUser, credit: Math.max(10 - (level - 1) * 2, 1) } } // decreasing reward
-    );
-
-    const referrer = await db.exec(
-      `SELECT id FROM User WHERE id IN 
-      (SELECT expand(in("REFERRED_BY")) FROM User WHERE id=:id)`,
-      { params: { id: currentUser } }
-    );
-
-    currentUser = referrer.length ? referrer[0].id : null;
-    level++;
-  }
-}
-
-
-app.get('/user/tree/:userId', async (req, res) => {
+// ------------------ USER UPLINE + DOWNLINE UPTO 5 LEVELS ------------------
+app.get('/user/network/:userId', async (req, res) => {
   const { userId } = req.params;
 
   try {
-      // Get user details
-      const user = await db.exec(
-          `SELECT id, name, position FROM User WHERE id=:id`, 
-          { params: { id: userId } }
-      );
+    const cacheKey = `userNetwork:${userId}`;
 
-      if (!user.length) {
-          return res.status(404).json({ message: "User not found." });
+    // 1️⃣ Check Cache
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({
+        message: "User network (cached)",
+        data: JSON.parse(cached),
+      });
+    }
+
+    // 2️⃣ Fetch User RID
+    const user = await db.exec(
+      `SELECT FROM User WHERE userId = :uid LIMIT 1`,
+      { params: { uid: userId } }
+    );
+
+    if (!user.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const userRID = user[0]['@rid'];
+
+    // -------------------------------
+    // 🔼 3️⃣ FETCH UPLINE (5 parents)
+    // -------------------------------
+    const uplineQuery = `
+      SELECT 
+        out('Parent')[0] as level1,
+        out('Parent')[0].out('Parent')[0] as level2,
+        out('Parent')[0].out('Parent')[0].out('Parent')[0] as level3,
+        out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0] as level4,
+        out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0] as level5
+      FROM ${userRID}
+    `;
+
+    const uplineRaw = await db.exec(uplineQuery);
+
+    const upline = Object.values(uplineRaw[0]).filter(x => x); // remove null
+
+
+    // ----------------------------------
+    // 🔽 4️⃣ FETCH DOWNLINE (5 levels)
+    // ----------------------------------
+
+    // Helper: Fetch Children of a node
+    async function getChildren(rid) {
+      return await db.exec(
+        `SELECT expand( in('Parent') ) FROM ${rid}`
+      );
+    }
+
+    const level1 = await getChildren(userRID);
+
+    let level2 = [];
+    for (const u of level1) {
+      level2.push(...await getChildren(u['@rid']));
+    }
+
+    let level3 = [];
+    for (const u of level2) {
+      level3.push(...await getChildren(u['@rid']));
+    }
+
+    let level4 = [];
+    for (const u of level3) {
+      level4.push(...await getChildren(u['@rid']));
+    }
+
+    let level5 = [];
+    for (const u of level4) {
+      level5.push(...await getChildren(u['@rid']));
+    }
+
+    // Combine downline
+    const combinedDownline = [
+      ...level1,
+      ...level2,
+      ...level3,
+      ...level4,
+      ...level5,
+    ];
+
+
+    // 🔥 Final Response
+    const finalData = {
+      user: user[0],
+      upline,
+      downline: {
+        level1,
+        level2,
+        level3,
+        level4,
+        level5,
+        combined: combinedDownline,
       }
-     console.log("userId--------------",userId);
-      // Build tree recursively
-      const tree = await buildUserTree(userId);
-      res.json({ tree });
+    };
+
+    // Cache 15 minutes
+    await redis.set(cacheKey, JSON.stringify(finalData), "EX", 60 * 15);
+
+    return res.status(200).json({
+      message: "User network (5-level) fetched",
+      data: finalData,
+    });
+
   } catch (error) {
-      res.status(500).json({ error: error.message });
+    console.error("Network fetch error:", error);
+    return res.status(500).json({
+      status: false,
+      message: "Internal server error",
+      error: error.message,
+    });
   }
 });
 
-/**
-* Recursively fetches user tree structure.
-*/
-async function buildUserTree(userId) {
-  // Fetch the current user's details
-  const user = await db.exec(
-      `SELECT id, name, position FROM User WHERE id=:id`, 
-      { params: { id: userId } }
-  );
 
-  if (!user.length) return null;
 
-  // Fetch children (LEFT & RIGHT)
-  const children = await db.exec(
-      `SELECT expand(out("REFERRED_BY")) FROM User WHERE id=:id`, // Ensuring correct direction
-      { params: { id: userId } }
-  );
+  // Basic health
+  app.get('/health', (req, res) => res.json({ ok: true }));
 
-  console.log(`User: ${user[0].name} (ID: ${user[0].id}) has children:`, children); // Debugging
-
-  let leftChild = children.find(child => child.position === 'left') || null;
-  let rightChild = children.find(child => child.position === 'right') || null;
-
-  return {
-      id: user[0].id,
-      name: user[0].name,
-      position: user[0].position,
-      left: leftChild ? await buildUserTree(leftChild.id) : null,
-      right: rightChild ? await buildUserTree(rightChild.id) : null
-  };
-}
-
-  // **Start Server**
   app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
 }
 
-// **Start the server only after connecting to DB**
-startServer().catch((err) => {
-  console.error("❌ Error starting server:", err);
-});
+startServer().catch((err) => console.error('❌ Error starting server:', err));
