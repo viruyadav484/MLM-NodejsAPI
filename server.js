@@ -270,64 +270,40 @@ console.log("-------------------6--------------------")
 });
 
 
-// ------------------ USER UPLINE + DOWNLINE UPTO 5 LEVELS ------------------
-app.get('/user/network/:userId', async (req, res) => {
+// ------------------ USER DOWNLINE UPTO 5 LEVELS ------------------
+app.get('/user/downline/:userId', async (req, res) => {
   const { userId } = req.params;
 
   try {
-    const cacheKey = `userNetwork:${userId}`;
+    // Clear cache during testing
+    await redis.del(`userDownline:${userId}`);
 
-    // 1️⃣ Check Cache
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      return res.status(200).json({
-        message: "User network (cached)",
-        data: JSON.parse(cached),
-      });
-    }
-
-    // 2️⃣ Fetch User RID
-    const user = await db.exec(
+    // 1️⃣ Fetch root user
+    const userResult = await db.exec(
       `SELECT FROM User WHERE userId = :uid LIMIT 1`,
       { params: { uid: userId } }
     );
 
-    if (!user.length) {
+    if (!userResult.length) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    const userRID = user[0]['@rid'];
+    const rootRID = userResult[0]['@rid'];
 
-    // -------------------------------
-    // 🔼 3️⃣ FETCH UPLINE (5 parents)
-    // -------------------------------
-    const uplineQuery = `
-      SELECT 
-        out('Parent')[0] as level1,
-        out('Parent')[0].out('Parent')[0] as level2,
-        out('Parent')[0].out('Parent')[0].out('Parent')[0] as level3,
-        out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0] as level4,
-        out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0].out('Parent')[0] as level5
-      FROM ${userRID}
-    `;
-
-    const uplineRaw = await db.exec(uplineQuery);
-
-    const upline = Object.values(uplineRaw[0]).filter(x => x); // remove null
-
-
-    // ----------------------------------
-    // 🔽 4️⃣ FETCH DOWNLINE (5 levels)
-    // ----------------------------------
-
-    // Helper: Fetch Children of a node
-    async function getChildren(rid) {
+    // -----------------------------
+    // ✅ HELPER: GET CHILDREN
+    // -----------------------------
+    async function getChildren(parentRID) {
       return await db.exec(
-        `SELECT expand( in('Parent') ) FROM ${rid}`
+        `SELECT FROM User WHERE parent = :pid`,
+        { params: { pid: parentRID } }
       );
     }
 
-    const level1 = await getChildren(userRID);
+    // -----------------------------
+    // 🔽 FETCH LEVELS
+    // -----------------------------
+    const level1 = await getChildren(rootRID);
 
     let level2 = [];
     for (const u of level1) {
@@ -349,8 +325,7 @@ app.get('/user/network/:userId', async (req, res) => {
       level5.push(...await getChildren(u['@rid']));
     }
 
-    // Combine downline
-    const combinedDownline = [
+    const combined = [
       ...level1,
       ...level2,
       ...level3,
@@ -358,33 +333,29 @@ app.get('/user/network/:userId', async (req, res) => {
       ...level5,
     ];
 
+    return res.status(200).json({
+      message: "User downline fetched successfully",
+      data: {
+        userId,
+        level1Count: level1.length,
+        level2Count: level2.length,
+        level3Count: level3.length,
+        level4Count: level4.length,
+        level5Count: level5.length,
+        totalDownline: combined.length,
 
-    // 🔥 Final Response
-    const finalData = {
-      user: user[0],
-      upline,
-      downline: {
         level1,
         level2,
         level3,
         level4,
         level5,
-        combined: combinedDownline,
+        combined,
       }
-    };
-
-    // Cache 15 minutes
-    await redis.set(cacheKey, JSON.stringify(finalData), "EX", 60 * 15);
-
-    return res.status(200).json({
-      message: "User network (5-level) fetched",
-      data: finalData,
     });
 
   } catch (error) {
-    console.error("Network fetch error:", error);
+    console.error("Downline error:", error);
     return res.status(500).json({
-      status: false,
       message: "Internal server error",
       error: error.message,
     });
@@ -392,6 +363,305 @@ app.get('/user/network/:userId', async (req, res) => {
 });
 
 
+// ------------------ USER UPLINE UPTO 5 LEVELS ------------------
+app.get('/user/upline/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const cacheKey = `userUpline:${userId}`;
+
+    // 1️⃣ Check Redis Cache
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({
+        message: "User upline (cached)",
+        data: JSON.parse(cached),
+      });
+    }
+
+    // 2️⃣ Fetch User
+    const userResult = await db.exec(
+      `SELECT FROM User WHERE userId = :uid LIMIT 1`,
+      { params: { uid: userId } }
+    );
+
+    if (!userResult.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // -----------------------------
+    // 🔼 FETCH LEVELS
+    // -----------------------------
+    const level1 = [];
+    const level2 = [];
+    const level3 = [];
+    const level4 = [];
+    const level5 = [];
+
+    let current = userResult[0];
+
+    // LEVEL 1
+    if (current.parent) {
+      const p1 = await db.exec(
+        `SELECT FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+      if (p1.length) {
+        level1.push(p1[0]);
+        current = p1[0];
+      }
+    }
+
+    // LEVEL 2
+    if (current?.parent) {
+      const p2 = await db.exec(
+        `SELECT FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+      if (p2.length) {
+        level2.push(p2[0]);
+        current = p2[0];
+      }
+    }
+
+    // LEVEL 3
+    if (current?.parent) {
+      const p3 = await db.exec(
+        `SELECT FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+      if (p3.length) {
+        level3.push(p3[0]);
+        current = p3[0];
+      }
+    }
+
+    // LEVEL 4
+    if (current?.parent) {
+      const p4 = await db.exec(
+        `SELECT FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+      if (p4.length) {
+        level4.push(p4[0]);
+        current = p4[0];
+      }
+    }
+
+    // LEVEL 5
+    if (current?.parent) {
+      const p5 = await db.exec(
+        `SELECT FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+      if (p5.length) {
+        level5.push(p5[0]);
+      }
+    }
+
+    const combined = [
+      ...level1,
+      ...level2,
+      ...level3,
+      ...level4,
+      ...level5,
+    ];
+
+    const finalData = {
+      userId,
+      level1Count: level1.length,
+      level2Count: level2.length,
+      level3Count: level3.length,
+      level4Count: level4.length,
+      level5Count: level5.length,
+      totalUpline: combined.length,
+
+      level1,
+      level2,
+      level3,
+      level4,
+      level5,
+      combined,
+    };
+
+    // 3️⃣ Cache for 15 minutes
+    await redis.set(cacheKey, JSON.stringify(finalData), "EX", 60 * 15);
+
+    return res.status(200).json({
+      message: "User upline fetched successfully",
+      data: finalData,
+    });
+
+  } catch (error) {
+    console.error("Upline error:", error);
+    return res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+app.get('/user/upline-ids/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const cacheKey = `userUplineIds:${userId}`;
+
+    // 1️⃣ Redis Cache
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({
+        message: "User upline ids (cached)",
+        data: JSON.parse(cached),
+      });
+    }
+
+    // 2️⃣ Fetch starting user
+    const userResult = await db.exec(
+      `SELECT FROM User WHERE userId = :uid LIMIT 1`,
+      { params: { uid: userId } }
+    );
+
+    if (!userResult.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // -----------------------------
+    // 🔼 FETCH ALL UPLINES
+    // -----------------------------
+    let current = userResult[0];
+    const uplineIds = [];
+
+    while (current?.parent) {
+      const parentResult = await db.exec(
+        `SELECT userId, parent FROM User WHERE @rid = :rid LIMIT 1`,
+        { params: { rid: current.parent } }
+      );
+
+      if (!parentResult.length) break;
+
+      const parentUser = parentResult[0];
+
+      uplineIds.push(parentUser.userId);
+
+      // stop explicitly at COMPANY if needed
+      if (parentUser.userId === 'COMPANY') break;
+
+      current = parentUser;
+    }
+
+    // 3️⃣ Cache for 15 minutes
+    await redis.set(cacheKey, JSON.stringify(uplineIds), "EX", 60 * 15);
+
+    return res.status(200).json({
+      message: "User upline ids fetched successfully",
+      data: uplineIds,
+    });
+
+  } catch (error) {
+    console.error("Upline ids error:", error);
+    return res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+
+app.get('/user/downline-ids/:userId', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    const cacheKey = `userDownlineIds:${userId}`;
+
+    // 1️⃣ Redis cache
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({
+        message: "User downline ids (cached)",
+        data: JSON.parse(cached),
+      });
+    }
+
+    // 2️⃣ Fetch root user
+    const userResult = await db.exec(
+      `SELECT FROM User WHERE userId = :uid LIMIT 1`,
+      { params: { uid: userId } }
+    );
+
+    if (!userResult.length) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const rootRID = userResult[0]['@rid'];
+
+    // -----------------------------
+    // 🔽 BFS DOWNLINE TRAVERSAL
+    // -----------------------------
+    const queue = [rootRID];
+    const downlineIds = [];
+
+    while (queue.length) {
+      const parentRID = queue.shift();
+
+      const children = await db.exec(
+        `SELECT @rid, userId FROM User WHERE parent = :pid`,
+        { params: { pid: parentRID } }
+      );
+
+      for (const child of children) {
+        downlineIds.push(child.userId);
+        queue.push(child['@rid']);
+      }
+    }
+
+    // 3️⃣ Cache 15 minutes
+    await redis.set(cacheKey, JSON.stringify(downlineIds), "EX", 60 * 15);
+
+    return res.status(200).json({
+      message: "User downline ids fetched successfully",
+      data: downlineIds
+    });
+
+  } catch (error) {
+    console.error("Downline ids error:", error);
+    return res.status(500).json({
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+});
+
+app.get('/users/bottom-to-top', async (req, res) => {
+  try {
+    const query = `
+      SELECT userId
+      FROM (
+        SELECT userId, depth
+        FROM UserVertex
+        WHILE in('ReferralEdge') IS NOT NULL
+      )
+      ORDER BY depth DESC
+    `;
+
+    const result = await db.exec(query);
+
+    const userIds = result.map(r => r.userId);
+
+    return res.status(200).json({
+      message: "Users fetched bottom to top",
+      count: userIds.length,
+      data: userIds
+    });
+
+  } catch (error) {
+    console.error("Bottom-to-top error:", error);
+    return res.status(500).json({
+      message: "Internal server error",
+      error: error.message
+    });
+  }
+});
 
   // Basic health
   app.get('/health', (req, res) => res.json({ ok: true }));
@@ -400,3 +670,4 @@ app.get('/user/network/:userId', async (req, res) => {
 }
 
 startServer().catch((err) => console.error('❌ Error starting server:', err));
+
